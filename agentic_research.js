@@ -1,3 +1,4 @@
+require('dotenv').config();
 const axios = require('axios');
 const { execSync } = require('child_process');
 const { spawnSync } = require('child_process');
@@ -13,7 +14,10 @@ const model = require('wink-eng-lite-web-model');
 const simpleStats = require('simple-statistics');
 const wink = winkNLP(model);
 
-const GEMINI_API_KEY = 'AIzaSyBKkpVJtPZuUkZ5hxV_1LQPUAXHAKg0k3M';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+  throw new Error('GEMINI_API_KEY is not set in environment variables. Please add it to your .env file.');
+}
 const LOG_FILE = path.join(__dirname, 'research_log.json');
 
 // === Cost Tracking ===
