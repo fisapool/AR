@@ -74,5 +74,18 @@ def subtopics():
         print("Error during subtopics extraction:", e)
         return jsonify({'subtopics': [], 'error': str(e)}), 500
 
+@app.route('/generate', methods=['POST'])
+def generate():
+    data = request.get_json(force=True)
+    prompt = data.get('prompt', '')
+    if not prompt or len(prompt) < 5:
+        return jsonify({'result': 'Prompt too short.'}), 400
+    try:
+        result = summarize.text_generator(prompt, max_length=64, num_return_sequences=1)[0]['generated_text']
+        return jsonify({'result': result})
+    except Exception as e:
+        print("Error during generation:", e)
+        return jsonify({'result': f'Error during generation: {str(e)}'}), 500
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000) 
