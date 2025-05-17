@@ -51,11 +51,45 @@ function estimateLocalSummarizerCost(calls, totalTime) {
 }
 
 async function ollamaAsk(prompt) {
-  console.log("[Debug] Sending prompt to Ollama:\n", prompt);
-  const ollama = spawnSync('ollama', ['run', 'mistral'], { input: prompt, encoding: 'utf-8' });
-  const response = ollama.stdout;
-  console.log("[Debug] Ollama response:\n", response);
-  return response;
+  console.log("[Debug] Sending prompt to Python LLM first:\n", prompt);
+  // 1. Try Python LLM first
+  try {
+    const pythonResult = await summarizeWithPythonAPI(prompt);
+    if (pythonResult && pythonResult.trim() !== "") {
+      return pythonResult;
+    } else {
+      console.warn("[Fallback] Python LLM returned empty. Trying Ollama.");
+    }
+  } catch (pyErr) {
+    console.warn(`[Fallback] Python LLM failed (${pyErr.message}). Trying Ollama.`);
+  }
+  // 2. Try Ollama next
+  try {
+    const ollama = spawnSync('ollama', ['run', 'mistral'], { input: prompt, encoding: 'utf-8' });
+    if (ollama.error || ollama.status !== 0 || !ollama.stdout || ollama.stdout.trim() === "") {
+      console.warn("[Fallback] Ollama not running or failed. Falling back to Gemini.");
+    } else {
+      const response = ollama.stdout;
+      console.log("[Debug] Ollama response:\n", response);
+      return response;
+    }
+  } catch (ollamaErr) {
+    console.warn(`[Fallback] Ollama call threw error: ${ollamaErr.message}. Falling back to Gemini.`);
+  }
+  // 3. Fallback: Use Gemini
+  try {
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const data = {
+      contents: [{ parts: [{ text: prompt }] }]
+    };
+    const response = await axios.post(apiUrl, data, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    return response.data.candidates[0].content.parts[0].text;
+  } catch (geminiErr) {
+    console.error(`[Error] All LLMs failed: ${geminiErr.message}`);
+    throw new Error('All LLMs failed');
+  }
 }
 
 // New: Get subtopics from Ollama
@@ -64,6 +98,26 @@ async function ollamaSubtopics(question) {
   const response = await ollamaAsk(prompt);
   // Split by lines, filter empty
   return response.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+// Get subtopics from Python API
+async function getSubtopics(question) {
+  try {
+    const response = await axios.post('http://localhost:5000/subtopics', { question }, { timeout: 10000 });
+    if (response.data.subtopics && response.data.subtopics.length > 0) {
+      return response.data.subtopics;
+    } else {
+      throw new Error('No subtopics returned from Python API');
+    }
+  } catch (e) {
+    // Fallback: Use Gemini to generate subtopics
+    console.warn(`[Fallback] Python subtopics API failed (${e.message}). Using Gemini for subtopics.`);
+    const prompt = `Given the research question: "${question}", list 5-7 key subtopics or aspects that should be covered to answer it comprehensively. Only return the subtopics, one per line.`;
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const data = { contents: [{ parts: [{ text: prompt }] }] };
+    const response = await axios.post(apiUrl, data, { headers: { 'Content-Type': 'application/json' } });
+    return response.data.candidates[0].content.parts[0].text.split('\n').map(s => s.trim()).filter(Boolean);
+  }
 }
 
 // New: For each subtopic, get relevant info from Gemini
@@ -212,8 +266,90 @@ function sortUrlsByDomainScore(urls, domainScores) {
   });
 }
 
+// Add autoSummarizeQuestion function using Gemini
+async function autoSummarizeQuestion(question) {
+  const prompt = `Summarize the following research question in one sentence, focusing only on the core scientific or technical challenge:\n\n${question}`;
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+  const data = { contents: [{ parts: [{ text: prompt }] }] };
+  const response = await axios.post(apiUrl, data, { headers: { 'Content-Type': 'application/json' } });
+  return response.data.candidates[0].content.parts[0].text.trim();
+}
+
+// Helper: Check if report is low quality (too short, generic, or just echoes the prompt)
+function isLowQualityReport(report, prompt) {
+  if (!report || report.length < 300) return true;
+  const lower = report.toLowerCase();
+  // If the report is just the prompt or contains only instructions, it's low quality
+  return (
+    lower.includes('write a report') ||
+    lower.includes('structure the report') ||
+    lower === prompt.toLowerCase().trim()
+  );
+}
+
+// Helper: Retry Gemini API call on 429
+async function callGeminiWithRetry(prompt, maxRetries = 3, delayMs = 10000) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+      const data = {
+        contents: [{ parts: [{ text: prompt }] }]
+      };
+      const response = await axios.post(apiUrl, data, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+      return response.data.candidates[0].content.parts[0].text;
+    } catch (e) {
+      if (e.response && e.response.status === 429) {
+        console.warn(`[Gemini] Rate limited (429). Waiting ${delayMs / 1000}s before retrying...`);
+        await new Promise(res => setTimeout(res, delayMs));
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw new Error('Gemini API rate limit exceeded after retries.');
+}
+
+// Helper: Get best parameters based on past runs
+function getBestParameters(logData) {
+  // Default parameters
+  let bestModel = 'mistral';
+  let bestPromptLength = 1024;
+  let fallbackOrder = ['mistral', 'llama3', 'gemini'];
+  // Analyze past runs for best validation
+  if (logData && logData.runs && logData.runs.length > 0) {
+    // Find the model with the highest average validation score (or lowest failure rate)
+    const modelStats = {};
+    logData.runs.forEach(run => {
+      const model = run.parameters?.model || 'mistral';
+      const valid = run.validation && !run.validation.toLowerCase().includes('insufficient') && !run.validation.toLowerCase().includes('fail');
+      if (!modelStats[model]) modelStats[model] = { total: 0, success: 0 };
+      modelStats[model].total++;
+      if (valid) modelStats[model].success++;
+    });
+    // Pick the model with the highest success rate
+    let best = bestModel, bestRate = 0;
+    for (const [model, stats] of Object.entries(modelStats)) {
+      const rate = stats.success / stats.total;
+      if (rate > bestRate) {
+        best = model;
+        bestRate = rate;
+      }
+    }
+    bestModel = best;
+  }
+  return { model: bestModel, promptLength: bestPromptLength, fallbackOrder };
+}
+
 // Main agentic research function (subtopic flow)
 async function agenticResearch(question, summarizer = 'Local Python') {
+  // Auto-summarize if the question is long
+  let processedQuestion = question;
+  if (question.length > 200) {
+    processedQuestion = await autoSummarizeQuestion(question);
+    console.log(`[AutoSummarize] Original question shortened to: ${processedQuestion}`);
+  }
   const researchStart = Date.now();
   let stepLogs = [];
   function logStep(msg) {
@@ -221,13 +357,19 @@ async function agenticResearch(question, summarizer = 'Local Python') {
     console.log(msg);
   }
   printProcessDiagram();
-  logStep(`[Step 1] User provides research question: "${question}"`);
-  // 1. Ask Ollama for subtopics
-  const subtopics = await ollamaSubtopics(question);
-  logStep(`[Step 2] Ollama subtopics: ${JSON.stringify(subtopics)}`);
+  logStep(`[Step 1] User provides research question: "${processedQuestion}"`);
+  // 1. Ask Python LLM for subtopics
+  const subtopics = await getSubtopics(processedQuestion);
+  logStep(`[Step 2] Python LLM subtopics: ${JSON.stringify(subtopics)}`);
   let researchLog = '';
-  let runLog = { question, subtopics: [], finalReport: '', validation: '', timestamp: new Date().toISOString() };
+  let runLog = { question: processedQuestion, subtopics: [], finalReport: '', validation: '', timestamp: new Date().toISOString() };
   let logData = loadLog();
+  const bestParams = getBestParameters(logData);
+  let currentModel = bestParams.model;
+  let currentPromptLength = bestParams.promptLength;
+  let currentFallbackOrder = bestParams.fallbackOrder;
+  let failureCount = 0;
+  const FAILURE_THRESHOLD = 2;
   for (const subtopic of subtopics) {
     logStep(`  [Step 3] Subtopic: ${subtopic}`);
     // 2. Use Gemini to get URLs for subtopic
@@ -264,7 +406,8 @@ async function agenticResearch(question, summarizer = 'Local Python') {
       return badPhrases.some(p => lower.includes(p));
     }
     // Retry loop for summarization
-    while (attempt < maxAttempts) {
+    let goodEnough = false;
+    while (attempt < maxAttempts && !goodEnough) {
       let url = null, content = null, validCount = 0, total = 0;
       if (attempt === 0) {
         // First attempt: try scraping URLs
@@ -277,36 +420,56 @@ async function agenticResearch(question, summarizer = 'Local Python') {
           if (summarizer === 'Local Python') {
             sum = await summarizeWithPythonAPI(content);
           } else {
-            sum = await geminiSummarizeContent(content, question, subtopic);
+            sum = await geminiSummarizeContent(content, processedQuestion, subtopic);
           }
           summary = `Source: ${url}\nSummary: ${sum}\n\n`;
           usedUrl = url;
           logStep(`    [Step 3] Successfully summarized content from: ${url}`);
         } else {
-          // Penalize all domains for failed scraping
-          sortedUrls.forEach(u => {
-            const d = getDomain(u);
-            logData.domainScores[d] = (logData.domainScores[d] || 0) - 2;
-            blacklistDomain(d, logData);
-          });
-          // Fallback: Ask Gemini to summarize the subtopic directly
-          geminiApiCalls++;
-          logStep(`    [Step 3] All URLs failed for subtopic. Using Gemini direct fallback.`);
-          const fallbackPrompt = `Provide a concise summary for the subtopic: "${subtopic}" (related to the research question: "${question}").`;
-          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-          const data = {
-            contents: [{ parts: [{ text: fallbackPrompt }] }]
-          };
-          const response = await axios.post(apiUrl, data, {
-            headers: { 'Content-Type': 'application/json' }
-          });
-          const fallbackSummary = response.data.candidates[0].content.parts[0].text;
-          summary = `Source: Gemini Direct\nSummary: ${fallbackSummary}\n\n`;
-          usedUrl = 'Gemini Direct';
-          logStep(`    [Step 3] Used Gemini direct fallback for subtopic.`);
+          // Fallback 1: Use local Python LLM to generate a summary for the subtopic
+          try {
+            const subtopicPrompt = `Write a concise summary for the subtopic: "${subtopic}" (related to the research question: "${processedQuestion}").`;
+            let sum = await summarizeWithPythonAPI(subtopicPrompt);
+            if (sum && sum.trim() !== "") {
+              summary = `Source: Local Python LLM\nSummary: ${sum}\n\n`;
+              usedUrl = 'Local Python LLM';
+              logStep(`    [Step 3] Used Local Python LLM fallback for subtopic.`);
+            } else {
+              throw new Error('Python LLM returned empty');
+            }
+          } catch (pyErr) {
+            logStep(`    [Step 3] Local Python LLM failed (${pyErr.message}). Trying Ollama.`);
+            try {
+              const ollamaPrompt = `Write a concise summary for the subtopic: "${subtopic}" (related to the research question: "${processedQuestion}").`;
+              let sum = await ollamaAsk(ollamaPrompt);
+              if (sum && sum.trim() !== "") {
+                summary = `Source: Ollama\nSummary: ${sum}\n\n`;
+                usedUrl = 'Ollama';
+                logStep(`    [Step 3] Used Ollama fallback for subtopic.`);
+              } else {
+                throw new Error('Ollama returned empty');
+              }
+            } catch (ollamaErr) {
+              logStep(`    [Step 3] Ollama failed (${ollamaErr.message}). Using Gemini as last resort.`);
+              // Fallback: Ask Gemini to summarize the subtopic directly
+              geminiApiCalls++;
+              const fallbackPrompt = `Provide a concise summary for the subtopic: "${subtopic}" (related to the research question: "${processedQuestion}").`;
+              const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+              const data = {
+                contents: [{ parts: [{ text: fallbackPrompt }] }]
+              };
+              const response = await axios.post(apiUrl, data, {
+                headers: { 'Content-Type': 'application/json' }
+              });
+              const fallbackSummary = response.data.candidates[0].content.parts[0].text;
+              summary = `Source: Gemini Direct\nSummary: ${fallbackSummary}\n\n`;
+              usedUrl = 'Gemini Direct';
+              logStep(`    [Step 3] Used Gemini direct fallback for subtopic.`);
+            }
+          }
         }
       } else {
-        // Retry: try next best URL (if any left)
+        // Optionally, try more URLs if available
         const remainingUrls = sortedUrls.filter(u => !triedUrls.includes(u));
         if (remainingUrls.length > 0) {
           ({ url, content, validCount, total } = await tryScrapeUrls(remainingUrls));
@@ -317,7 +480,7 @@ async function agenticResearch(question, summarizer = 'Local Python') {
             if (summarizer === 'Local Python') {
               sum = await summarizeWithPythonAPI(content);
             } else {
-              sum = await geminiSummarizeContent(content, question, subtopic);
+              sum = await geminiSummarizeContent(content, processedQuestion, subtopic);
             }
             summary = `Source: ${url}\nSummary: ${sum}\n\n`;
             usedUrl = url;
@@ -332,7 +495,7 @@ async function agenticResearch(question, summarizer = 'Local Python') {
             // Fallback: Ask Gemini again with a more focused prompt
             geminiApiCalls++;
             logStep(`    [Step 3] Retry: All URLs failed again. Using Gemini direct fallback.`);
-            const fallbackPrompt = `Try again: Provide a concise, relevant summary for the subtopic: "${subtopic}" (related to the research question: "${question}"). Focus on key facts and avoid irrelevant information.`;
+            const fallbackPrompt = `Try again: Provide a concise, relevant summary for the subtopic: "${subtopic}" (related to the research question: "${processedQuestion}"). Focus on key facts and avoid irrelevant information.`;
             const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
             const data = {
               contents: [{ parts: [{ text: fallbackPrompt }] }]
@@ -352,20 +515,21 @@ async function agenticResearch(question, summarizer = 'Local Python') {
       }
       triedUrls.push(usedUrl);
       // 3. Ollama: Is info sufficient for this subtopic?
-      sufficiency = await ollamaSubtopicSufficiency(question, subtopic, summary);
+      sufficiency = await ollamaSubtopicSufficiency(processedQuestion, subtopic, summary);
       logStep(`    [Step 3] Ollama sufficiency check: ${sufficiency}`);
-      // If summary is low quality or insufficient, retry
-      if (
-        sufficiency.toLowerCase().includes('no') ||
-        isLowQualitySummary(summary)
-      ) {
-        attempt++;
-        logStep(`    [Step 3] Attempt ${attempt}: Info insufficient or summary low quality, retrying...`);
-        insufficient = true;
-        continue;
-      } else {
-        insufficient = false;
+      // Accept 'good enough' after 2 attempts
+      if (attempt >= 1 && /yes|sufficient|good enough/i.test(sufficiency)) {
+        goodEnough = true;
+        logStep(`    [Step 3] Accepting 'good enough' answer after ${attempt + 1} attempts.`);
         break;
+      }
+      if (/yes/i.test(sufficiency)) {
+        break;
+      }
+      attempt++;
+      if (attempt >= maxAttempts) {
+        logStep(`    [Step 3] Max attempts reached. Accepting last summary as 'good enough'.`);
+        goodEnough = true;
       }
     }
     if (insufficient) {
@@ -387,39 +551,80 @@ async function agenticResearch(question, summarizer = 'Local Python') {
       logStep(`    [Step 3] Ollama says more info may be needed for subtopic.`);
     }
   }
-  // 4. Gemini: Generate the final report
-  // Build a full prompt for Gemini with all subtopic summaries
+  // Build missingNotes for insufficient subtopics
   let missingNotes = '';
   runLog.subtopics.forEach(sub => {
     if (
-      sub.sufficiency.toLowerCase().includes('no') ||
-      sub.summary.includes('[Warning: All attempts to get a sufficient summary')
+      (sub.sufficiency && sub.sufficiency.toLowerCase().includes('no')) ||
+      (sub.summary && sub.summary.includes('[Warning: All attempts to get a sufficient summary'))
     ) {
       missingNotes += `- Subtopic "${sub.subtopic}" is missing or insufficient. Please try to infer or supplement this section.\n`;
     }
   });
-  const finalReportPrompt = `Given the research question: "${question}"
-  and the following subtopic summaries:
-  ${researchLog}
-  ${missingNotes ? 'Note: Some subtopics are missing or insufficient. ' + missingNotes : ''}
-  Please write a 300-word report addressing the research question, synthesizing the information from the subtopic summaries above. Structure the report clearly and concisely. If any subtopic is missing, try to infer or supplement the information as best as possible.`;
-  logStep(`[Step 4] Gemini final report prompt:\n${finalReportPrompt}`);
 
+  // 4. Final Report Generation with Fallbacks and Word Limits
   let finalReport;
-  if (summarizer === 'Local Python') {
-    // Use local Python LLM for final report synthesis
-    finalReport = await summarizeWithPythonAPI(finalReportPrompt);
-  } else {
-    // Use Gemini for final report synthesis
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const data = {
-      contents: [{ parts: [{ text: finalReportPrompt }] }]
-    };
-    const response = await axios.post(apiUrl, data, {
-      headers: { 'Content-Type': 'application/json' }
-    });
-    finalReport = response.data.candidates[0].content.parts[0].text;
+  let errorLog = [];
+
+  // 1. Try Local Python LLM (2000 words)
+  const pythonPrompt = `Given the research question: "${processedQuestion}"
+and the following subtopic summaries:
+${researchLog}
+${missingNotes ? 'Note: Some subtopics are missing or insufficient. ' + missingNotes : ''}
+Please write a report of up to 2000 words addressing the research question, synthesizing the information from the subtopic summaries above. Structure the report clearly and concisely. If any subtopic is missing, try to infer or supplement the information as best as possible.`;
+
+  try {
+    finalReport = await summarizeWithPythonAPI(pythonPrompt);
+    logStep(`[Debug] Python LLM report output: ${finalReport}`);
+    if (isLowQualityReport(finalReport, pythonPrompt)) throw new Error('Python LLM output too short or generic');
+  } catch (e1) {
+    errorLog.push('Python LLM failed: ' + e1.message);
+
+    // 2. Try Ollama (500 words)
+    const ollamaPrompt = `Given the research question: "${processedQuestion}"
+and the following subtopic summaries:
+${researchLog}
+${missingNotes ? 'Note: Some subtopics are missing or insufficient. ' + missingNotes : ''}
+Please write a report of up to 500 words addressing the research question, synthesizing the information from the subtopic summaries above. Structure the report clearly and concisely. If any subtopic is missing, try to infer or supplement the information as best as possible.`;
+
+    try {
+      finalReport = await ollamaAsk(ollamaPrompt);
+      logStep(`[Debug] Ollama report output: ${finalReport}`);
+      if (isLowQualityReport(finalReport, ollamaPrompt)) throw new Error('Ollama output too short or generic');
+    } catch (e2) {
+      errorLog.push('Ollama failed: ' + e2.message);
+
+      // 3. Fallback to local /summarize endpoint (long report)
+      const fallbackPrompt = `Given the research question: "${processedQuestion}"
+and the following subtopic summaries:
+${researchLog}
+${missingNotes ? 'Note: Some subtopics are missing or insufficient. ' + missingNotes : ''}
+Please write a long, structured report addressing the research question, synthesizing the information from the subtopic summaries above. Structure the report clearly and concisely. If any subtopic is missing, try to infer or supplement the information as best as possible.`;
+
+      try {
+        const response = await axios.post('http://localhost:5000/summarize', { text: fallbackPrompt }, { timeout: 60000 });
+        finalReport = response.data.summary;
+        logStep(`[Debug] Fallback Python LLM report output: ${finalReport}`);
+        if (isLowQualityReport(finalReport, fallbackPrompt)) throw new Error('Fallback Python LLM output too short or generic');
+      } catch (e3) {
+        errorLog.push('Fallback Python LLM failed: ' + e3.message);
+        failureCount++;
+        if (failureCount < FAILURE_THRESHOLD) {
+          // Auto re-query: switch model or increase prompt length
+          currentModel = (currentModel === 'mistral') ? 'llama3' : 'mistral';
+          currentPromptLength += 256;
+          logStep(`[Self-Adapt] Auto re-querying with model: ${currentModel}, promptLength: ${currentPromptLength}`);
+          // Re-run agenticResearch with new parameters (recursive call)
+          return await agenticResearch(question, { model: currentModel, promptLength: currentPromptLength, fallbackOrder: currentFallbackOrder });
+        } else {
+          // Escalate for manual review
+          errorLog.push('Escalated for manual review after repeated failures.');
+          finalReport = '[ERROR: All summarizers failed after retries. Escalated for manual review.]\n' + errorLog.join('\n');
+        }
+      }
+    }
   }
+
   logStep(`\n[Step 5] [Agent] Final Report:\n${finalReport}\n`);
   runLog.finalReport = finalReport;
 
@@ -484,6 +689,34 @@ async function agenticResearch(question, summarizer = 'Local Python') {
   // Track total research run time
   const researchTotalTime = (Date.now() - researchStart) / 1000;
   logStep(`[Cost Tracking] Total research run time: ${researchTotalTime.toFixed(2)}s`);
+
+  // === Billing Logic: 100% Markup ===
+  // Determine which backend produced the final report
+  let finalReportSource = 'Gemini';
+  if (finalReport && finalReport.includes('Ollama')) finalReportSource = 'Ollama';
+  if (finalReport && finalReport.includes('Local Python LLM')) finalReportSource = 'Local Python';
+
+  let baseCost = parseFloat(geminiCost.total) + parseFloat(localSummarizerCost.total);
+  if (finalReportSource === 'Ollama') {
+    baseCost += 0.01;
+  }
+  let userCharge = baseCost * 2; // 100% markup
+  userCharge = userCharge.toFixed(2);
+  logStep(`[Billing] User will be charged: $${userCharge} for this report.`);
+  runLog.billing = {
+    baseCost: baseCost.toFixed(4),
+    userCharge,
+    details: {
+      gemini: geminiCost,
+      local: localSummarizerCost,
+      ollama: finalReportSource === 'Ollama' ? 0.01 : 0
+    }
+  };
+
+  // Log parameters and validation for each run
+  runLog.parameters = { model: currentModel, promptLength: currentPromptLength, fallbackOrder: currentFallbackOrder };
+  runLog.validation = runLog.validation || '';
+
   // Return all details for API or further analysis
   return {
     report: finalReport + citations,
@@ -521,8 +754,16 @@ module.exports = { agenticResearch };
 async function summarizeWithPythonAPI(text) {
   localSummarizerCalls++;
   const start = Date.now();
-  const response = await axios.post('http://localhost:5000/summarize', { text });
+  const response = await axios.post('http://localhost:5000/summarize', { text }, { timeout: 10000 });
   localSummarizerTotalTime += (Date.now() - start) / 1000;
+  // Check for error in summary
+  if (
+    !response.data.summary ||
+    response.data.summary.toLowerCase().includes('error during summarization') ||
+    response.data.summary.toLowerCase().includes('input too short')
+  ) {
+    throw new Error(response.data.summary || 'Unknown error from Python summarizer');
+  }
   return response.data.summary;
 }
 
@@ -533,7 +774,7 @@ async function summarizeWithPythonAPI(text) {
  * @returns {Promise<string>} answer
  */
 async function qaWithPythonAPI(context, question) {
-  const response = await axios.post('http://localhost:5000/qa', { context, question });
+  const response = await axios.post('http://localhost:5000/qa', { context, question }, { timeout: 10000 });
   return response.data.answer;
 }
 
