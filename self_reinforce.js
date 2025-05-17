@@ -4,19 +4,13 @@ const path = require('path');
 
 // Helper: Generate a new research question using the local Python LLM or Gemini
 async function generateResearchQuestion() {
-  // Try Python LLM first, fallback to Gemini
+  // Try Python LLM first, no Gemini fallback
   const prompt = 'Generate a novel, interesting research question in science or technology.';
   try {
     const summary = await summarizeWithPythonAPI(prompt);
     return summary.trim();
   } catch (e) {
-    // Fallback: Gemini
-    const axios = require('axios');
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const data = { contents: [{ parts: [{ text: prompt }] }] };
-    const response = await axios.post(apiUrl, data, { headers: { 'Content-Type': 'application/json' } });
-    return response.data.candidates[0].content.parts[0].text.trim();
+    throw new Error('Python LLM failed to generate research question and Gemini fallback is disabled.');
   }
 }
 
