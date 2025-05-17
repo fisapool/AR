@@ -3,7 +3,7 @@ from transformers import pipeline
 
 summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 # Upgrade to an even larger model for subtopic generation
-text_generator = pipeline("text-generation", model="EleutherAI/gpt-neo-2.7B")
+text_generator = pipeline("text-generation", model="distilgpt2")
 
 def get_subtopics(question):
     prompt = f"Given the research question: '{question}', list 5-7 key subtopics or aspects that should be covered to answer it comprehensively. Only return the subtopics, one per line."
